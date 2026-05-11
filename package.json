@@ -1,0 +1,45 @@
+{
+  "name": "mpp-remote",
+  "version": "0.0.1",
+  "description": "stdio MCP bridge with automatic MPP payment handling and native SOCKS proxy support",
+  "type": "module",
+  "bin": {
+    "mpp-remote": "./bin/mpp-remote.mjs"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "mpp",
+    "x402",
+    "stdio",
+    "bridge",
+    "proxy",
+    "socks",
+    "agent",
+    "payments"
+  ],
+  "author": "tellyworth",
+  "license": "GPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tellyworth/mpp-remote.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tellyworth/mpp-remote/issues"
+  },
+  "homepage": "https://github.com/tellyworth/mpp-remote#readme",
+  "dependencies": {
+    "axios": "^1.7.7",
+    "https-proxy-agent": "^7.0.5",
+    "socks-proxy-agent": "^8.0.4",
+    "viem": "^2.21.0"
+  }
+}
