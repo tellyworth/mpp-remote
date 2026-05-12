@@ -1,10 +1,19 @@
 #!/usr/bin/env node
 /*
- * mpp-remote — stdio MCP bridge with MPP payment handling.
+ * mpp-remote — stdio MCP bridge with x402 v1 payment handling.
  *
  * Reads JSON-RPC requests from Claude Code (or any MCP client) over stdin,
- * forwards them to a remote HTTP MCP server, and transparently handles MPP
- * payment challenges (JSON-RPC -32042) by settling on-chain and retrying.
+ * forwards them to a remote HTTP MCP server, and transparently handles
+ * x402 v1 MCP-transport payment-required responses by signing an EIP-3009
+ * authorization and retrying.
+ *
+ * Wire protocol: coinbase/x402 specs/transports-v1/mcp.md.
+ *   Payment-required: CallToolResult { isError: true, structuredContent: PaymentRequirementsResponse }
+ *   Payment payload : _meta["x402/payment"]        = PaymentPayload object
+ *   Settled receipt : _meta["x402/payment-response"] = SettlementResponse object
+ *
+ * mpp-remote signs only — it does NOT broadcast transactions. The resource
+ * server's facilitator does that.
  *
  * Configuration:
  *
@@ -19,27 +28,21 @@
  *
  *   Environment:
  *     HTTPS_PROXY / ALL_PROXY   proxy URL if --proxy not given
- *     MPP_WALLET_PRIVATE_KEY    0x-prefixed hex key for settlement
- *     MPP_MAX_AMOUNT_USD        per-call spending cap (default: 1.0)
- *     RPC_URL                   override blockchain RPC (default: chain's
- *                               viem-built-in public RPC)
+ *     MPP_WALLET_PRIVATE_KEY    0x-prefixed hex key used to SIGN EIP-3009
+ *                               authorizations (no gas needed; the facilitator
+ *                               broadcasts). Name kept for back-compat.
+ *     MPP_MAX_AMOUNT_USD        per-call spending cap (default: 1.0). Compared
+ *                               against decoded maxAmountRequired / decimals.
  *     MPP_DEBUG                 if set, log forwarded JSON-RPC to stderr
  */
 
 import readline from 'node:readline';
+import { randomBytes } from 'node:crypto';
 import axios from 'axios';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
-import {
-	createWalletClient,
-	createPublicClient,
-	http,
-	encodeFunctionData,
-	parseUnits,
-	getAddress,
-} from 'viem';
+import { getAddress } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import * as chains from 'viem/chains';
 
 const USAGE = `Usage: mpp-remote [options] <url>
 
@@ -49,9 +52,8 @@ Options:
 
 Env:
   HTTPS_PROXY / ALL_PROXY    proxy URL (if --proxy not set)
-  MPP_WALLET_PRIVATE_KEY     wallet key for settling MPP challenges
+  MPP_WALLET_PRIVATE_KEY     wallet key for signing x402 EIP-3009 authorizations
   MPP_MAX_AMOUNT_USD         per-call spending cap (default 1.0)
-  RPC_URL                    override blockchain RPC
   MPP_DEBUG                  log forwarded JSON-RPC to stderr
 `;
 
@@ -123,106 +125,144 @@ const upstream = axios.create({
 const account = PK ? privateKeyToAccount(PK) : null;
 if (account) log(`wallet: ${account.address}`);
 
-// Map MPP method.network strings to viem chain objects. The MPP spec leaves
-// network naming loose; this covers the common shorthand used by x402-era
-// servers. Extend as new networks appear.
-const CHAIN_BY_NETWORK = {
-	base: chains.base,
-	'base-sepolia': chains.baseSepolia,
-	mainnet: chains.mainnet,
-	ethereum: chains.mainnet,
-	sepolia: chains.sepolia,
-	polygon: chains.polygon,
-	optimism: chains.optimism,
-	'optimism-sepolia': chains.optimismSepolia,
-	arbitrum: chains.arbitrum,
+// x402 v1 EVM network → chainId. Subset of EVM_NETWORK_CHAIN_ID_MAP from
+// coinbase/x402 mechanisms/evm/v1. Extend if servers advertise more.
+const CHAIN_ID_BY_NETWORK = {
+	base: 8453,
+	'base-sepolia': 84532,
+	ethereum: 1,
+	sepolia: 11155111,
+	polygon: 137,
+	'polygon-amoy': 80002,
 };
 
-const ERC20_TRANSFER_ABI = [
-	{
-		type: 'function',
-		name: 'transfer',
-		stateMutability: 'nonpayable',
-		inputs: [
-			{ name: 'to', type: 'address' },
-			{ name: 'value', type: 'uint256' },
-		],
-		outputs: [{ name: '', type: 'bool' }],
-	},
-];
+// EIP-3009 TransferWithAuthorization typed-data structure (x402 v1 §6.1.1).
+const EIP3009_TYPES = {
+	TransferWithAuthorization: [
+		{ name: 'from', type: 'address' },
+		{ name: 'to', type: 'address' },
+		{ name: 'value', type: 'uint256' },
+		{ name: 'validAfter', type: 'uint256' },
+		{ name: 'validBefore', type: 'uint256' },
+		{ name: 'nonce', type: 'bytes32' },
+	],
+};
 
-// Settle a challenge by sending an ERC20 transfer on-chain. This matches the
-// x402-style "pay then submit tx hash as credential" pattern used by many
-// MPP servers today. EIP-3009 transferWithAuthorization support is on the
-// roadmap — see README.
-async function settle(challenge) {
+// USDC and most x402 assets are 6 decimals. If/when we add non-6-decimal assets
+// we'll need to fetch decimals() from chain or accept a config table.
+const DEFAULT_DECIMALS = 6;
+
+// ---- x402 detection + signing -------------------------------------------
+
+// Pull a PaymentRequirementsResponse out of a tools/call result, returning null
+// if this isn't an x402 payment-required signal. The MCP transport spec puts it
+// in result.structuredContent; clients SHOULD fall back to content[0].text.
+function extractX402Requirements(result) {
+	if (!result || result.isError !== true) return null;
+
+	const structured = result.structuredContent;
+	if (structured && typeof structured === 'object' && structured.x402Version) {
+		return structured;
+	}
+
+	const text = result.content?.[0]?.text;
+	if (typeof text === 'string' && text.length > 0) {
+		try {
+			const parsed = JSON.parse(text);
+			if (parsed && parsed.x402Version) return parsed;
+		} catch {
+			// Not JSON, not x402 — fall through.
+		}
+	}
+
+	return null;
+}
+
+// Convert a PaymentRequirements maxAmountRequired (atomic units string) to a
+// human-readable USD-ish number for the spending cap check. USDC = 6 decimals.
+function atomicToFloat(amountAtomic) {
+	const n = BigInt(amountAtomic);
+	const divisor = 10n ** BigInt(DEFAULT_DECIMALS);
+	const whole = Number(n / divisor);
+	const frac = Number(n % divisor) / Number(divisor);
+	return whole + frac;
+}
+
+async function signPayment(requirementsResponse) {
 	if (!account) {
-		throw new Error('MPP_WALLET_PRIVATE_KEY is not set; cannot settle challenge');
+		throw new Error('MPP_WALLET_PRIVATE_KEY is not set; cannot sign x402 payment');
 	}
-	const amount = parseFloat(challenge.amount);
-	if (!Number.isFinite(amount)) {
-		throw new Error(`invalid challenge.amount: ${challenge.amount}`);
+
+	const accepts = requirementsResponse.accepts;
+	if (!Array.isArray(accepts) || accepts.length === 0) {
+		throw new Error('x402 PaymentRequirementsResponse has no accepts[]');
 	}
-	if (amount > MAX_AMOUNT) {
+
+	// Find the first scheme/network we can satisfy. We only sign "exact" on supported chains today.
+	const req = accepts.find(
+		(r) =>
+			r.scheme === 'exact' &&
+			CHAIN_ID_BY_NETWORK[r.network] !== undefined &&
+			r.payTo &&
+			r.asset,
+	);
+	if (!req) {
+		const summary = accepts.map((r) => `${r.scheme}/${r.network}`).join(', ');
+		throw new Error(`no satisfiable x402 requirement (have: ${summary})`);
+	}
+
+	if (!req.extra?.name || !req.extra?.version) {
 		throw new Error(
-			`charge ${challenge.amount} exceeds MPP_MAX_AMOUNT_USD=${MAX_AMOUNT}`,
+			`PaymentRequirements.extra must include name and version for EIP-712 domain (got: ${JSON.stringify(req.extra)})`,
 		);
 	}
 
-	// First method we know how to handle.
-	const method = challenge.methods.find(
-		(m) =>
-			m.id?.startsWith('eip3009-usdc-') ||
-			m.id?.startsWith('erc20-') ||
-			m.currency_contract,
-	);
-	if (!method) {
-		const ids = challenge.methods.map((m) => m.id).join(', ');
-		throw new Error(`no installed method matches challenge methods: ${ids}`);
+	const amountFloat = atomicToFloat(req.maxAmountRequired);
+	if (amountFloat > MAX_AMOUNT) {
+		throw new Error(
+			`charge ${amountFloat} ${req.extra.name} exceeds MPP_MAX_AMOUNT_USD=${MAX_AMOUNT}`,
+		);
 	}
 
-	const chain = CHAIN_BY_NETWORK[method.network];
-	if (!chain) {
-		throw new Error(`unsupported network: ${method.network}`);
-	}
-	const rpc = process.env.RPC_URL ?? chain.rpcUrls?.default?.http?.[0];
-	if (!rpc) {
-		throw new Error(`no RPC URL for network ${method.network} (set RPC_URL)`);
-	}
+	const now = Math.floor(Date.now() / 1000);
+	const authorization = {
+		from: account.address,
+		to: getAddress(req.payTo),
+		value: req.maxAmountRequired,
+		// 10 min in the past for clock-skew headroom; matches x402 reference impl.
+		validAfter: String(now - 600),
+		validBefore: String(now + (req.maxTimeoutSeconds ?? 60)),
+		nonce: '0x' + randomBytes(32).toString('hex'),
+	};
+
+	const domain = {
+		name: req.extra.name,
+		version: req.extra.version,
+		chainId: CHAIN_ID_BY_NETWORK[req.network],
+		verifyingContract: getAddress(req.asset),
+	};
 
 	console.error(
-		`[mpp-remote] settling ${challenge.amount} ${method.currency} ` +
-			`(sku=${challenge.sku}, network=${method.network})`,
+		`[mpp-remote] signing x402 payment ${req.maxAmountRequired} atomic ` +
+			`(${req.extra.name}, ${req.network}, resource=${req.resource ?? '?'})`,
 	);
 
-	const wallet = createWalletClient({ account, chain, transport: http(rpc) });
-	const pub = createPublicClient({ chain, transport: http(rpc) });
-
-	const data = encodeFunctionData({
-		abi: ERC20_TRANSFER_ABI,
-		functionName: 'transfer',
-		args: [
-			getAddress(method.recipient_address),
-			parseUnits(challenge.amount, method.currency_decimals),
-		],
+	// EIP-712 signing is purely off-chain — no wallet client or RPC needed.
+	const signature = await account.signTypedData({
+		domain,
+		types: EIP3009_TYPES,
+		primaryType: 'TransferWithAuthorization',
+		message: authorization,
 	});
-	const txHash = await wallet.sendTransaction({
-		to: getAddress(method.currency_contract),
-		data,
-	});
-	console.error(`[mpp-remote] tx submitted: ${txHash}`);
-
-	const receipt = await pub.waitForTransactionReceipt({ hash: txHash });
-	if (receipt.status !== 'success') {
-		throw new Error(`tx ${txHash} reverted`);
-	}
-	console.error(`[mpp-remote] settled in block ${receipt.blockNumber}`);
 
 	return {
-		method: method.id,
-		challenge_id: challenge.challenge_id,
-		opaque: challenge.opaque,
-		settlement_tx_hash: txHash,
+		x402Version: 1,
+		scheme: 'exact',
+		network: req.network,
+		payload: {
+			signature,
+			authorization,
+		},
 	};
 }
 
@@ -242,33 +282,45 @@ async function post(body) {
 
 async function forward(req) {
 	const res = await post(req);
-	if (req.method !== 'tools/call' || res?.error?.code !== -32042) {
-		return res;
-	}
-	const challenges = res.error.data?.challenges;
-	if (!Array.isArray(challenges) || challenges.length === 0) {
-		return res;
-	}
+	if (req.method !== 'tools/call') return res;
+
+	const reqs = extractX402Requirements(res?.result);
+	if (!reqs) return res;
+
 	try {
-		const credential = await settle(challenges[0]);
+		const paymentPayload = await signPayment(reqs);
 		return await post({
 			...req,
 			params: {
 				...req.params,
 				_meta: {
 					...(req.params?._meta ?? {}),
-					'org.paymentauth/credential': credential,
+					'x402/payment': paymentPayload,
 				},
 			},
 		});
 	} catch (e) {
+		// Surface as an x402-shaped tool result so MCP clients see the error in-context.
 		return {
 			jsonrpc: '2.0',
 			id: req.id,
-			error: {
-				code: -32042,
-				message: `MPP settlement failed: ${e.message}`,
-				data: res.error.data,
+			result: {
+				isError: true,
+				structuredContent: {
+					x402Version: 1,
+					error: `mpp-remote: ${e.message}`,
+					accepts: reqs.accepts ?? [],
+				},
+				content: [
+					{
+						type: 'text',
+						text: JSON.stringify({
+							x402Version: 1,
+							error: `mpp-remote: ${e.message}`,
+							accepts: reqs.accepts ?? [],
+						}),
+					},
+				],
 			},
 		};
 	}
