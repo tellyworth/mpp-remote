@@ -21,10 +21,11 @@ Alpha. x402 v1 "exact" scheme on EVM chains
 (Base, Base Sepolia, Ethereum, Sepolia, Polygon, Polygon Amoy).
 Tested against the Cloudup MCP server backed by the Coinbase facilitator.
 
-The name remains `mpp-remote` for npm/install URL stability — older versions
-spoke MPP `-32042`. The current version speaks x402 v1 MCP transport
-(`specs/transports-v1/mcp.md` in `coinbase/x402`). The MPP code path was
-removed.
+Name retained from the MPP era for command and import-path continuity —
+older versions spoke MPP `-32042`. The current version speaks x402 v1 MCP
+transport (`specs/transports-v1/mcp.md` in `coinbase/x402`); the MPP code
+path was removed. The package is not yet published to npm; install via the
+GitHub specifier shown below.
 
 ## Install
 
