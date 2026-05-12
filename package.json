@@ -1,7 +1,7 @@
 {
   "name": "mpp-remote",
   "version": "0.0.1",
-  "description": "stdio MCP bridge with automatic MPP payment handling and native SOCKS proxy support",
+  "description": "stdio MCP bridge with automatic x402 v1 payment handling and native SOCKS proxy support",
   "type": "module",
   "bin": {
     "mpp-remote": "./bin/mpp-remote.mjs"
