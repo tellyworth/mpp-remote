@@ -1,6 +1,6 @@
 {
   "name": "mpp-remote",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "stdio MCP bridge with automatic x402 v1 payment handling and native SOCKS proxy support",
   "type": "module",
   "bin": {
