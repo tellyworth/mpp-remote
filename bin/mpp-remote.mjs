@@ -26,12 +26,20 @@
  *                               http://, https://, socks5://, socks5h://
  *     --help                    print this help
  *
- *   Environment:
- *     HTTPS_PROXY / ALL_PROXY   proxy URL if --proxy not given
- *     PRIVY_WALLET_ADDRESS      address of the Privy agent wallet to sign
- *                               with. Required. User must have run
- *                               `paw login` once so the CLI has a session.
+ *   Environment (exactly one signer must be configured):
+ *     PRIVY_WALLET_ADDRESS      address of a Privy agent wallet to sign
+ *                               with. User must have run `paw login` once
+ *                               so the CLI has a session. Preferred on
+ *                               dev machines — the signing key never
+ *                               leaves Privy.
  *     PRIVY_AGENT_WALLET_BIN    override the CLI binary (default: paw).
+ *     MPP_WALLET_PRIVATE_KEY    0x-prefixed hex private key. Signs locally
+ *                               with viem. Suitable for unattended
+ *                               contexts (CI, build agents) where Privy's
+ *                               browser login can't run.
+ *
+ *   Other environment:
+ *     HTTPS_PROXY / ALL_PROXY   proxy URL if --proxy not given
  *     MPP_MAX_AMOUNT_USD        per-call spending cap (default: 1.0). Compared
  *                               against decoded maxAmountRequired / decimals.
  *     MPP_DEBUG                 if set, log forwarded JSON-RPC to stderr
@@ -44,6 +52,7 @@ import axios from 'axios';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { getAddress, isHex } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
 
 const USAGE = `Usage: mpp-remote [options] <url>
 
@@ -51,10 +60,13 @@ Options:
   --proxy <url>   proxy for upstream HTTP (http://, https://, socks5://, socks5h://)
   --help          show this help
 
-Env:
-  HTTPS_PROXY / ALL_PROXY    proxy URL (if --proxy not set)
-  PRIVY_WALLET_ADDRESS       address of the Privy agent wallet (required)
+Env (set exactly one signer):
+  PRIVY_WALLET_ADDRESS       sign via Privy agent-wallet CLI (dev machines)
   PRIVY_AGENT_WALLET_BIN     override the CLI binary (default: paw)
+  MPP_WALLET_PRIVATE_KEY     0x-hex key signed locally with viem (CI/headless)
+
+Other env:
+  HTTPS_PROXY / ALL_PROXY    proxy URL (if --proxy not set)
   MPP_MAX_AMOUNT_USD         per-call spending cap (default 1.0)
   MPP_DEBUG                  log forwarded JSON-RPC to stderr
 `;
@@ -92,13 +104,21 @@ const args = parseArgs(process.argv.slice(2));
 const PROXY = args.proxy || process.env.HTTPS_PROXY || process.env.ALL_PROXY;
 const PRIVY_ADDRESS = process.env.PRIVY_WALLET_ADDRESS;
 const PRIVY_BIN = process.env.PRIVY_AGENT_WALLET_BIN || 'paw';
+const LOCAL_KEY = process.env.MPP_WALLET_PRIVATE_KEY;
 const MAX_AMOUNT = parseFloat(process.env.MPP_MAX_AMOUNT_USD ?? '1.0');
 const DEBUG = !!process.env.MPP_DEBUG;
 
-if (!PRIVY_ADDRESS) {
+if (PRIVY_ADDRESS && LOCAL_KEY) {
 	console.error(
-		'mpp-remote: PRIVY_WALLET_ADDRESS is not set. Run `paw login` and pass ' +
-			'the resulting Ethereum address via PRIVY_WALLET_ADDRESS.',
+		'mpp-remote: both PRIVY_WALLET_ADDRESS and MPP_WALLET_PRIVATE_KEY are set. ' +
+			'Configure exactly one signer.',
+	);
+	process.exit(2);
+}
+if (!PRIVY_ADDRESS && !LOCAL_KEY) {
+	console.error(
+		'mpp-remote: no signer configured. Set PRIVY_WALLET_ADDRESS (after `paw login`) ' +
+			'for the Privy CLI path, or MPP_WALLET_PRIVATE_KEY for the local-key path.',
 	);
 	process.exit(2);
 }
@@ -190,8 +210,10 @@ function privyAccount({ binary, address }) {
 	};
 }
 
-const account = privyAccount({ binary: PRIVY_BIN, address: PRIVY_ADDRESS });
-log(`wallet: ${account.address}`);
+const account = PRIVY_ADDRESS
+	? privyAccount({ binary: PRIVY_BIN, address: PRIVY_ADDRESS })
+	: privateKeyToAccount(LOCAL_KEY);
+log(`wallet: ${account.address} (${PRIVY_ADDRESS ? 'privy' : 'local'})`);
 
 // x402 v1 EVM network → chainId. Subset of EVM_NETWORK_CHAIN_ID_MAP from
 // coinbase/x402 mechanisms/evm/v1. Extend if servers advertise more.
