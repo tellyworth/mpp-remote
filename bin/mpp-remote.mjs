@@ -28,9 +28,10 @@
  *
  *   Environment:
  *     HTTPS_PROXY / ALL_PROXY   proxy URL if --proxy not given
- *     MPP_WALLET_PRIVATE_KEY    0x-prefixed hex key used to SIGN EIP-3009
- *                               authorizations (no gas needed; the facilitator
- *                               broadcasts). Name kept for back-compat.
+ *     PRIVY_WALLET_ADDRESS      address of the Privy agent wallet to sign
+ *                               with. Required. User must have run
+ *                               `paw login` once so the CLI has a session.
+ *     PRIVY_AGENT_WALLET_BIN    override the CLI binary (default: paw).
  *     MPP_MAX_AMOUNT_USD        per-call spending cap (default: 1.0). Compared
  *                               against decoded maxAmountRequired / decimals.
  *     MPP_DEBUG                 if set, log forwarded JSON-RPC to stderr
@@ -38,11 +39,11 @@
 
 import readline from 'node:readline';
 import { randomBytes } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import axios from 'axios';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
-import { getAddress } from 'viem';
-import { privateKeyToAccount } from 'viem/accounts';
+import { getAddress, isHex } from 'viem';
 
 const USAGE = `Usage: mpp-remote [options] <url>
 
@@ -52,7 +53,8 @@ Options:
 
 Env:
   HTTPS_PROXY / ALL_PROXY    proxy URL (if --proxy not set)
-  MPP_WALLET_PRIVATE_KEY     wallet key for signing x402 EIP-3009 authorizations
+  PRIVY_WALLET_ADDRESS       address of the Privy agent wallet (required)
+  PRIVY_AGENT_WALLET_BIN     override the CLI binary (default: paw)
   MPP_MAX_AMOUNT_USD         per-call spending cap (default 1.0)
   MPP_DEBUG                  log forwarded JSON-RPC to stderr
 `;
@@ -88,9 +90,18 @@ function parseArgs(argv) {
 
 const args = parseArgs(process.argv.slice(2));
 const PROXY = args.proxy || process.env.HTTPS_PROXY || process.env.ALL_PROXY;
-const PK = process.env.MPP_WALLET_PRIVATE_KEY;
+const PRIVY_ADDRESS = process.env.PRIVY_WALLET_ADDRESS;
+const PRIVY_BIN = process.env.PRIVY_AGENT_WALLET_BIN || 'paw';
 const MAX_AMOUNT = parseFloat(process.env.MPP_MAX_AMOUNT_USD ?? '1.0');
 const DEBUG = !!process.env.MPP_DEBUG;
+
+if (!PRIVY_ADDRESS) {
+	console.error(
+		'mpp-remote: PRIVY_WALLET_ADDRESS is not set. Run `paw login` and pass ' +
+			'the resulting Ethereum address via PRIVY_WALLET_ADDRESS.',
+	);
+	process.exit(2);
+}
 
 function log(...m) {
 	if (DEBUG) console.error('[mpp-remote]', ...m);
@@ -122,8 +133,65 @@ const upstream = axios.create({
 
 // ---- wallet --------------------------------------------------------------
 
-const account = PK ? privateKeyToAccount(PK) : null;
-if (account) log(`wallet: ${account.address}`);
+// Privy adapter: signs EIP-712 typed data by shelling out to
+// @privy-io/agent-wallet-cli (`paw rpc --json`). The CLI POSTs to Privy's
+// /v1/wallets/<id>/rpc with the caller's authorization keypair (provisioned
+// by `paw login` and stored in the OS keychain), so no private key ever
+// touches this process or the user's filesystem.
+//
+// `signPayment` only ever calls `account.signTypedData`; we match viem's
+// Account interface for that one method, which is all this codebase needs.
+//
+// Response shape varies — the CLI's own internal helper falls back through
+// `.data.signature → .signature → .data`, so we do the same.
+function privyAccount({ binary, address }) {
+	return {
+		address: getAddress(address),
+		async signTypedData({ domain, types, primaryType, message }) {
+			const body = JSON.stringify({
+				method: 'eth_signTypedData_v4',
+				params: {
+					typed_data: {
+						domain,
+						types,
+						message,
+						...(primaryType ? { primary_type: primaryType } : {}),
+					},
+				},
+			});
+			const r = spawnSync(binary, ['rpc', '--json', body], {
+				encoding: 'utf8',
+				stdio: ['ignore', 'pipe', 'pipe'],
+			});
+			if (r.error) {
+				throw new Error(
+					`failed to invoke ${binary}: ${r.error.message}. Install with ` +
+						`\`npm i -g @privy-io/agent-wallet-cli\` or set PRIVY_AGENT_WALLET_BIN.`,
+				);
+			}
+			if (r.status !== 0) {
+				const detail = (r.stderr || r.stdout || '').trim();
+				throw new Error(`${binary} rpc failed (exit ${r.status}): ${detail}`);
+			}
+			let parsed;
+			try {
+				parsed = JSON.parse(r.stdout.trim());
+			} catch {
+				throw new Error(`${binary} rpc returned non-JSON: ${r.stdout.slice(0, 200)}`);
+			}
+			const sig = parsed.data?.signature ?? parsed.signature ?? parsed.data;
+			if (typeof sig !== 'string' || !isHex(sig)) {
+				throw new Error(
+					`${binary} rpc returned no signature (got: ${JSON.stringify(parsed).slice(0, 200)})`,
+				);
+			}
+			return sig;
+		},
+	};
+}
+
+const account = privyAccount({ binary: PRIVY_BIN, address: PRIVY_ADDRESS });
+log(`wallet: ${account.address}`);
 
 // x402 v1 EVM network → chainId. Subset of EVM_NETWORK_CHAIN_ID_MAP from
 // coinbase/x402 mechanisms/evm/v1. Extend if servers advertise more.
@@ -189,10 +257,6 @@ function atomicToFloat(amountAtomic) {
 }
 
 async function signPayment(requirementsResponse) {
-	if (!account) {
-		throw new Error('MPP_WALLET_PRIVATE_KEY is not set; cannot sign x402 payment');
-	}
-
 	const accepts = requirementsResponse.accepts;
 	if (!Array.isArray(accepts) || accepts.length === 0) {
 		throw new Error('x402 PaymentRequirementsResponse has no accepts[]');
