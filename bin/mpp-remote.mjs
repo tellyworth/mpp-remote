@@ -41,7 +41,12 @@
  *   Other environment:
  *     HTTPS_PROXY / ALL_PROXY   proxy URL if --proxy not given
  *     MPP_MAX_AMOUNT_USD        per-call spending cap (default: 1.0). Compared
- *                               against decoded maxAmountRequired / decimals.
+ *                               against maxAmountRequired decoded with the
+ *                               decimals of the matched allowlist entry.
+ *     MPP_ASSET_ALLOWLIST       JSON object merged over the built-in
+ *                               per-chain asset allowlist. Required to add
+ *                               assets beyond the built-in entries. See
+ *                               BUILTIN_ASSET_ALLOWLIST below for the shape.
  *     MPP_DEBUG                 if set, log forwarded JSON-RPC to stderr
  */
 
@@ -68,6 +73,7 @@ Env (set exactly one signer):
 Other env:
   HTTPS_PROXY / ALL_PROXY    proxy URL (if --proxy not set)
   MPP_MAX_AMOUNT_USD         per-call spending cap (default 1.0)
+  MPP_ASSET_ALLOWLIST        JSON map of additional accepted assets per chain
   MPP_DEBUG                  log forwarded JSON-RPC to stderr
 `;
 
@@ -238,9 +244,70 @@ const EIP3009_TYPES = {
 	],
 };
 
-// USDC and most x402 assets are 6 decimals. If/when we add non-6-decimal assets
-// we'll need to fetch decimals() from chain or accept a config table.
-const DEFAULT_DECIMALS = 6;
+// Cap on signed authorization validity, regardless of what the server requests.
+// Each signed auth is independently replayable on-chain until validBefore (or
+// until first submission). An unbounded window turns one approved payment into
+// a long-lived blank check; 5 minutes is generous for facilitator latency.
+const MAX_AUTH_LIFETIME_SECONDS = 300;
+
+// Per-chain allowlist of acceptable assets. The bridge refuses to sign for any
+// (chainId, asset) pair not in this map. Each entry pins:
+//   - decimals: used for the MPP_MAX_AMOUNT_USD cap math. A misconfigured
+//     decimals lets a server quote a "0.20"-looking integer that signs away
+//     orders of magnitude more on-chain value.
+//   - domain.name / domain.version: the EIP-712 domain the bridge will sign
+//     under. These are server-supplied in PaymentRequirements.extra and the
+//     bridge must verify them, otherwise the server picks the domain
+//     separator and gets a signing oracle for arbitrary EIP-712-shaped data.
+// To extend without patching this file, set MPP_ASSET_ALLOWLIST to a JSON
+// object of the same shape; entries are merged per-chain (env wins).
+const BUILTIN_ASSET_ALLOWLIST = {
+	// Base mainnet — native USDC (Circle).
+	8453: {
+		'0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913': {
+			decimals: 6,
+			domain: { name: 'USDC', version: '2' },
+		},
+	},
+	// Base Sepolia testnet — USDC.
+	84532: {
+		'0x036CbD53842c5426634e7929541eC2318f3dCF7e': {
+			decimals: 6,
+			domain: { name: 'USDC', version: '2' },
+		},
+	},
+};
+
+function checksumAllowlist(raw) {
+	const out = {};
+	for (const [chainId, assets] of Object.entries(raw)) {
+		out[Number(chainId)] = {};
+		for (const [addr, entry] of Object.entries(assets)) {
+			out[Number(chainId)][getAddress(addr)] = entry;
+		}
+	}
+	return out;
+}
+
+function loadAssetAllowlist() {
+	const merged = JSON.parse(JSON.stringify(BUILTIN_ASSET_ALLOWLIST));
+	const raw = process.env.MPP_ASSET_ALLOWLIST;
+	if (raw) {
+		let extra;
+		try {
+			extra = JSON.parse(raw);
+		} catch (e) {
+			console.error(`mpp-remote: MPP_ASSET_ALLOWLIST is not valid JSON: ${e.message}`);
+			process.exit(2);
+		}
+		for (const [chainId, assets] of Object.entries(extra)) {
+			merged[chainId] = { ...(merged[chainId] ?? {}), ...assets };
+		}
+	}
+	return checksumAllowlist(merged);
+}
+
+const ASSET_ALLOWLIST = loadAssetAllowlist();
 
 // ---- x402 detection + signing -------------------------------------------
 
@@ -269,10 +336,13 @@ function extractX402Requirements(result) {
 }
 
 // Convert a PaymentRequirements maxAmountRequired (atomic units string) to a
-// human-readable USD-ish number for the spending cap check. USDC = 6 decimals.
-function atomicToFloat(amountAtomic) {
+// human-readable number for the spending cap check, using the decimals from
+// the matched allowlist entry. Using a fixed default here would let a server
+// quote a value in a non-6-decimal asset whose 6-decimal interpretation
+// passes the cap.
+function atomicToFloat(amountAtomic, decimals) {
 	const n = BigInt(amountAtomic);
-	const divisor = 10n ** BigInt(DEFAULT_DECIMALS);
+	const divisor = 10n ** BigInt(decimals);
 	const whole = Number(n / divisor);
 	const frac = Number(n % divisor) / Number(divisor);
 	return whole + frac;
@@ -303,34 +373,56 @@ async function signPayment(requirementsResponse) {
 		);
 	}
 
-	const amountFloat = atomicToFloat(req.maxAmountRequired);
+	const chainId = CHAIN_ID_BY_NETWORK[req.network];
+	const assetAddress = getAddress(req.asset);
+	const allowlistEntry = ASSET_ALLOWLIST[chainId]?.[assetAddress];
+	if (!allowlistEntry) {
+		throw new Error(
+			`asset ${assetAddress} on chain ${chainId} (${req.network}) is not in the asset allowlist; ` +
+				`extend BUILTIN_ASSET_ALLOWLIST or set MPP_ASSET_ALLOWLIST`,
+		);
+	}
+	if (
+		req.extra.name !== allowlistEntry.domain.name ||
+		req.extra.version !== allowlistEntry.domain.version
+	) {
+		throw new Error(
+			`EIP-712 domain for ${assetAddress} (${req.network}) must be ` +
+				`name=${JSON.stringify(allowlistEntry.domain.name)} version=${JSON.stringify(allowlistEntry.domain.version)}, ` +
+				`server quoted name=${JSON.stringify(req.extra.name)} version=${JSON.stringify(req.extra.version)}`,
+		);
+	}
+
+	const amountFloat = atomicToFloat(req.maxAmountRequired, allowlistEntry.decimals);
 	if (amountFloat > MAX_AMOUNT) {
 		throw new Error(
-			`charge ${amountFloat} ${req.extra.name} exceeds MPP_MAX_AMOUNT_USD=${MAX_AMOUNT}`,
+			`charge ${amountFloat} ${allowlistEntry.domain.name} exceeds MPP_MAX_AMOUNT_USD=${MAX_AMOUNT}`,
 		);
 	}
 
 	const now = Math.floor(Date.now() / 1000);
+	const requestedLifetime = req.maxTimeoutSeconds ?? 60;
+	const lifetime = Math.min(requestedLifetime, MAX_AUTH_LIFETIME_SECONDS);
 	const authorization = {
 		from: account.address,
 		to: getAddress(req.payTo),
 		value: req.maxAmountRequired,
 		// 10 min in the past for clock-skew headroom; matches x402 reference impl.
 		validAfter: String(now - 600),
-		validBefore: String(now + (req.maxTimeoutSeconds ?? 60)),
+		validBefore: String(now + lifetime),
 		nonce: '0x' + randomBytes(32).toString('hex'),
 	};
 
 	const domain = {
-		name: req.extra.name,
-		version: req.extra.version,
-		chainId: CHAIN_ID_BY_NETWORK[req.network],
-		verifyingContract: getAddress(req.asset),
+		name: allowlistEntry.domain.name,
+		version: allowlistEntry.domain.version,
+		chainId,
+		verifyingContract: assetAddress,
 	};
 
 	console.error(
-		`[mpp-remote] signing x402 payment ${req.maxAmountRequired} atomic ` +
-			`(${req.extra.name}, ${req.network}, resource=${req.resource ?? '?'})`,
+		`[mpp-remote] signing x402 payment ${amountFloat} ${allowlistEntry.domain.name} ` +
+			`(${req.network}, asset=${assetAddress}, resource=${req.resource ?? '?'})`,
 	);
 
 	// EIP-712 signing is purely off-chain — no wallet client or RPC needed.
