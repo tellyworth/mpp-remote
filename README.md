@@ -73,7 +73,31 @@ Environment variables:
 | `HTTPS_PROXY`/`ALL_PROXY` | Proxy URL if `--proxy` is not given. Same scheme support as `--proxy`.       |
 | `MPP_WALLET_PRIVATE_KEY`  | `0x`-prefixed hex key. Used to **sign** EIP-3009 authorizations (no gas).    |
 | `MPP_MAX_AMOUNT_USD`      | Per-call spending cap. Default `1.0`. The bridge refuses any larger charge. |
+| `MPP_ASSET_ALLOWLIST`     | JSON object merged over the built-in per-chain asset allowlist. See below.   |
 | `MPP_DEBUG`               | If set, log forwarded JSON-RPC to stderr.                                    |
+
+### Asset allowlist
+
+The bridge will only sign payments for `(chainId, asset)` pairs in its
+allowlist. Each entry pins the asset's `decimals` (used for the
+`MPP_MAX_AMOUNT_USD` cap math) and the EIP-712 `domain.name`/`domain.version`
+the bridge will sign under. The server's `PaymentRequirements.extra` must
+match the entry's domain or signing is refused.
+
+Built-in entries cover native USDC on Base mainnet and Base Sepolia. To accept
+additional assets without patching the source, set `MPP_ASSET_ALLOWLIST` to a
+JSON object of the same shape (entries are merged per-chain; env wins on
+collision). Example for Ethereum mainnet USDC:
+
+```bash
+MPP_ASSET_ALLOWLIST='{"1":{"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48":{"decimals":6,"domain":{"name":"USDC","version":"2"}}}}'
+```
+
+This is a guard against a malicious or compromised upstream server quoting a
+payment in a non-USDC token (or in USDC's atomic units interpreted under the
+wrong decimals) to slip past the per-call cap. Without the allowlist, the
+"$0.20" cap could permit hundreds of dollars of on-chain value to be signed
+away if the wallet holds any other ERC-20.
 
 Env-var names are kept stable across the MPP→x402 transition so existing
 configurations work without changes; only the wire protocol changed.
