@@ -61,7 +61,7 @@ import readline from 'node:readline';
 import { McpClient } from '../lib/mcp-client.mjs';
 import { loadWalletEnv } from '../lib/cli-env.mjs';
 import { loadAssetAllowlist } from '../lib/x402.mjs';
-import { loadHook, injectHookTools, hookOwnsTool, dispatchHookCall } from '../lib/hook.mjs';
+import { loadHook, forwardWithHook } from '../lib/hook.mjs';
 
 const USAGE = `Usage: mpp-remote [options] <url>
 
@@ -119,20 +119,25 @@ function parseArgs(argv) {
 const args = parseArgs(process.argv.slice(2));
 const DEBUG = !!process.env.MPP_DEBUG;
 
-// Info-level events (signer choice, session id, x402 signing trace, hook
-// load) — unconditional. The DEBUG flag is for the JSON-RPC frame trace only.
+// Info-level events are always-on (notably the x402 signing trace, which
+// trunk also printed unconditionally). Debug-level events fire only with
+// MPP_DEBUG set — wallet/proxy/session/frame trace. Matches trunk's mixed
+// model so existing users don't see new stderr noise.
 function info(m) {
 	console.error('[mpp-remote]', m);
 }
 function debug(...m) {
 	if (DEBUG) console.error('[mpp-remote]', ...m);
 }
+function debugLog(m) {
+	if (DEBUG) console.error('[mpp-remote]', m);
+}
 
 // ---- env loading ---------------------------------------------------------
 
 let wallet;
 try {
-	wallet = loadWalletEnv({ proxyOverride: args.proxy, logger: info });
+	wallet = loadWalletEnv({ proxyOverride: args.proxy, debugLogger: debugLog });
 } catch (e) {
 	console.error(`mpp-remote: ${e.message}`);
 	process.exit(2);
@@ -153,6 +158,7 @@ const client = new McpClient({
 	maxAmount: wallet.maxAmount,
 	assetAllowlist,
 	logger: info,
+	debugLogger: debugLog,
 });
 
 // ---- hook ----------------------------------------------------------------
@@ -170,22 +176,7 @@ if (args.hook) {
 
 // ---- MCP forwarding ------------------------------------------------------
 
-async function forward(req) {
-	// Hook intercept first: tools/call for a hook-owned tool short-circuits
-	// the upstream forward entirely.
-	if (hook && hookOwnsTool(hook, req)) {
-		return dispatchHookCall(hook, req, { client, logger: info });
-	}
-
-	const res = await client.forwardRequest(req);
-
-	// Augment tools/list with hook-provided tools on the way back.
-	if (hook && req.method === 'tools/list' && res?.result) {
-		res.result = injectHookTools(res.result, hook.tools);
-	}
-
-	return res;
-}
+const forward = (req) => forwardWithHook(req, { client, hook, logger: info });
 
 // ---- stdio loop ----------------------------------------------------------
 

@@ -14,6 +14,7 @@ import {
 	injectHookTools,
 	hookOwnsTool,
 	dispatchHookCall,
+	forwardWithHook,
 } from '../lib/hook.mjs';
 
 // ---- helpers ------------------------------------------------------------
@@ -221,25 +222,47 @@ test('dispatchHookCall: undefined return becomes isError', async () => {
 	assert.match(out.result.content[0].text, /returned undefined/);
 });
 
-test('dispatchHookCall: handle receives client + logger from context', async () => {
+test('dispatchHookCall: handle receives narrowed { callTool, logger } context', async () => {
 	const seen = {};
 	const hook = {
 		tools: [{ name: 'foo' }],
-		async handle({ client, logger }) {
-			seen.client = client;
-			seen.logger = logger;
-			logger('hello from hook');
+		async handle(ctx) {
+			seen.keys = Object.keys(ctx).sort();
+			seen.callToolIsFn = typeof ctx.callTool === 'function';
+			ctx.logger('hello from hook');
 			return { content: [{ type: 'text', text: 'ok' }] };
 		},
 	};
 	const logs = [];
-	const fakeClient = { sentinel: 'I am the client' };
-	await dispatchHookCall(hook, callReq(1, 'foo'), {
+	const fakeClient = { callTool: async () => ({ result: { content: [] } }) };
+	await dispatchHookCall(hook, callReq(1, 'foo', { a: 1 }), {
 		client: fakeClient,
 		logger: (m) => logs.push(m),
 	});
-	assert.equal(seen.client, fakeClient);
+	assert.deepEqual(seen.keys, ['args', 'callTool', 'logger', 'name']);
+	assert.equal(seen.callToolIsFn, true);
 	assert.deepEqual(logs, ['hello from hook']);
+});
+
+test('dispatchHookCall: callTool delegates to client.callTool', async () => {
+	const fakeClient = {
+		called: null,
+		async callTool(name, args, extraMeta) {
+			this.called = { name, args, extraMeta };
+			return { jsonrpc: '2.0', id: 99, result: { content: [{ type: 'text', text: 'upstream-said-hi' }] } };
+		},
+	};
+	const hook = {
+		tools: [{ name: 'wrap' }],
+		async handle({ callTool }) {
+			const r = await callTool('upstream_tool', { x: 7 });
+			return { content: [{ type: 'text', text: r.result.content[0].text }] };
+		},
+	};
+	const out = await dispatchHookCall(hook, callReq(1, 'wrap'), { client: fakeClient });
+	assert.equal(fakeClient.called.name, 'upstream_tool');
+	assert.deepEqual(fakeClient.called.args, { x: 7 });
+	assert.equal(out.result.content[0].text, 'upstream-said-hi');
 });
 
 test('dispatchHookCall: handle is awaited (async work resolves before response)', async () => {
@@ -264,4 +287,97 @@ test('end-to-end: loadHook then dispatchHookCall', async () => {
 		assert.equal(out.id, 7);
 		assert.match(out.result.content[0].text, /\/tmp\/x/);
 	});
+});
+
+// ---- forwardWithHook (bridge dispatch) ----------------------------------
+
+// Minimal McpClient stand-in for forwardWithHook tests. forwardRequest just
+// records what it received and returns whatever the test set as `nextResponse`.
+function fakeClient({ nextResponse, callToolImpl } = {}) {
+	const seen = [];
+	return {
+		seen,
+		async forwardRequest(req) {
+			seen.push(req);
+			return nextResponse;
+		},
+		async callTool(name, args, extraMeta) {
+			if (callToolImpl) return callToolImpl(name, args, extraMeta);
+			return { jsonrpc: '2.0', id: 0, result: { content: [] } };
+		},
+	};
+}
+
+test('forwardWithHook: no hook → forwards everything verbatim', async () => {
+	const client = fakeClient({ nextResponse: { jsonrpc: '2.0', id: 1, result: { ok: true } } });
+	const req = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'anything', arguments: {} } };
+	const out = await forwardWithHook(req, { client, hook: null });
+	assert.deepEqual(client.seen, [req]);
+	assert.deepEqual(out.result, { ok: true });
+});
+
+test('forwardWithHook: tools/call for hook-owned tool short-circuits', async () => {
+	const hook = {
+		tools: [{ name: 'mine' }],
+		async handle() {
+			return { content: [{ type: 'text', text: 'handled locally' }] };
+		},
+	};
+	const client = fakeClient({ nextResponse: { jsonrpc: '2.0', result: { ok: 'upstream' } } });
+	const out = await forwardWithHook(callReq(3, 'mine'), { client, hook });
+	assert.equal(client.seen.length, 0); // upstream NOT contacted
+	assert.equal(out.result.content[0].text, 'handled locally');
+});
+
+test('forwardWithHook: tools/call for unrelated tool forwards upstream', async () => {
+	const hook = {
+		tools: [{ name: 'mine' }],
+		async handle() {
+			throw new Error('should not be called');
+		},
+	};
+	const upstreamResp = { jsonrpc: '2.0', id: 4, result: { content: [{ type: 'text', text: 'upstream ok' }] } };
+	const client = fakeClient({ nextResponse: upstreamResp });
+	const out = await forwardWithHook(callReq(4, 'other'), { client, hook });
+	assert.equal(client.seen.length, 1);
+	assert.equal(client.seen[0].params.name, 'other');
+	assert.equal(out, upstreamResp);
+});
+
+test('forwardWithHook: tools/list response is augmented with hook tools', async () => {
+	const hook = { tools: [{ name: 'mine', description: 'd' }], async handle() {} };
+	const upstreamResp = {
+		jsonrpc: '2.0',
+		id: 5,
+		result: { tools: [{ name: 'a' }, { name: 'b' }] },
+	};
+	const client = fakeClient({ nextResponse: upstreamResp });
+	const req = { jsonrpc: '2.0', id: 5, method: 'tools/list', params: {} };
+	const out = await forwardWithHook(req, { client, hook });
+	assert.deepEqual(out.result.tools.map((t) => t.name), ['a', 'b', 'mine']);
+});
+
+test('forwardWithHook: tools/list name collision resolves to hook entry', async () => {
+	const hook = { tools: [{ name: 'a', source: 'hook' }], async handle() {} };
+	const upstreamResp = {
+		jsonrpc: '2.0',
+		id: 6,
+		result: { tools: [{ name: 'a', source: 'upstream' }, { name: 'b' }] },
+	};
+	const client = fakeClient({ nextResponse: upstreamResp });
+	const out = await forwardWithHook(
+		{ jsonrpc: '2.0', id: 6, method: 'tools/list', params: {} },
+		{ client, hook },
+	);
+	const aEntry = out.result.tools.find((t) => t.name === 'a');
+	assert.equal(aEntry.source, 'hook');
+});
+
+test('forwardWithHook: non-tools methods pass through untouched', async () => {
+	const hook = { tools: [{ name: 'mine' }], async handle() {} };
+	const upstreamResp = { jsonrpc: '2.0', id: 7, result: { protocolVersion: '2025-06-18' } };
+	const client = fakeClient({ nextResponse: upstreamResp });
+	const req = { jsonrpc: '2.0', id: 7, method: 'initialize', params: {} };
+	const out = await forwardWithHook(req, { client, hook });
+	assert.equal(out, upstreamResp);
 });

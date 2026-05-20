@@ -162,9 +162,9 @@ export default {
   tools: [
     { name: 'upload', description: '...', inputSchema: { /* ... */ } },
   ],
-  async handle({ name, args, client, logger }) {
+  async handle({ name, args, callTool, logger }) {
     if (name !== 'upload') return null;
-    const begin = await client.callTool('begin_upload', { /* ... */ });
+    const begin = await callTool('begin_upload', { /* ... */ });
     // ... S3 PUT, complete_upload, etc.
     return { content: [{ type: 'text', text: shareUrl }], structuredContent: { /* ... */ } };
   },
@@ -177,16 +177,17 @@ Contract:
   wins.
 - `tools/call` for a hook-owned tool short-circuits the upstream forward;
   `handle()` runs locally and its return becomes the tool result.
+- `handle()` receives a narrowed context: `{ name, args, callTool, logger }`.
+  `callTool(name, args, extraMeta?)` reaches upstream tools through the same
+  session and handles x402 payment-required retries internally — hooks never
+  see signing.
 - `handle()` must return a `CallToolResult`-shaped object (`{ content?,
   structuredContent?, isError? }`). Exceptions and null/undefined returns
   become `isError: true` tool results — the bridge keeps running.
-- `client.callTool(name, args)` reaches upstream tools and handles x402
-  payment-required retries automatically, so the hook never needs to know
-  about signing.
 
 `mppRemoteApi: 1` is the contract version. Future incompatible changes bump
 the integer; the bridge rejects hooks whose declared version it doesn't
-support.
+support. Additive changes (extra fields on the context object) don't bump.
 
 ## Roadmap
 
