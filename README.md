@@ -64,6 +64,7 @@ Flags:
 | Flag             | Description                                                                                              |
 | ---------------- | -------------------------------------------------------------------------------------------------------- |
 | `--proxy <url>`  | Proxy URL for upstream HTTP. Supports `http://`, `https://`, `socks5://`, `socks5h://`. Wins over env.   |
+| `--hook <path>`  | ESM module that adds tools and intercepts `tools/call` for them. See [Hooks](#hooks).                    |
 | `--help`         | Show usage.                                                                                              |
 
 Environment variables:
@@ -141,6 +142,51 @@ response passes through verbatim.
 
 If you don't need payment handling, [`mcp-remote`](https://github.com/geelen/mcp-remote)
 is the canonical choice. `mpp-remote` is for the x402-paid case.
+
+## Hooks
+
+`--hook <path>` loads an ESM module that adds tools to the bridge's
+`tools/list` response and intercepts `tools/call` for those tools. The hook
+runs in the bridge process and receives a working `McpClient` (already
+session-initialized, x402 retry built in) so it can call upstream tools to
+implement higher-level operations.
+
+The intended use case is collapsing multi-step MCP ceremonies into one tool
+call — e.g. wrapping a `begin_upload` → S3 PUT → `complete_upload` flow into
+a single `upload(path)` tool from the agent's perspective.
+
+```js
+// my-hook.mjs
+export default {
+  mppRemoteApi: 1,
+  tools: [
+    { name: 'upload', description: '...', inputSchema: { /* ... */ } },
+  ],
+  async handle({ name, args, client, logger }) {
+    if (name !== 'upload') return null;
+    const begin = await client.callTool('begin_upload', { /* ... */ });
+    // ... S3 PUT, complete_upload, etc.
+    return { content: [{ type: 'text', text: shareUrl }], structuredContent: { /* ... */ } };
+  },
+};
+```
+
+Contract:
+
+- `tools[]` is appended to upstream's `tools/list`. On name collision the hook
+  wins.
+- `tools/call` for a hook-owned tool short-circuits the upstream forward;
+  `handle()` runs locally and its return becomes the tool result.
+- `handle()` must return a `CallToolResult`-shaped object (`{ content?,
+  structuredContent?, isError? }`). Exceptions and null/undefined returns
+  become `isError: true` tool results — the bridge keeps running.
+- `client.callTool(name, args)` reaches upstream tools and handles x402
+  payment-required retries automatically, so the hook never needs to know
+  about signing.
+
+`mppRemoteApi: 1` is the contract version. Future incompatible changes bump
+the integer; the bridge rejects hooks whose declared version it doesn't
+support.
 
 ## Roadmap
 
