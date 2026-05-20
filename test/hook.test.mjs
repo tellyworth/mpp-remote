@@ -150,6 +150,34 @@ test('injectHookTools: malformed toolsList returns unchanged', () => {
 	assert.equal(injectHookTools(noTools, [{ name: 'a' }]), noTools);
 });
 
+test('injectHookTools: skips injection when nextCursor present (mid-page)', () => {
+	// Pagination: if the server is mid-walk and signaling more pages via
+	// nextCursor, we must NOT inject — otherwise the client's aggregate sees
+	// hook tools duplicated across pages. They get injected on the final page.
+	const out = injectHookTools(
+		{ tools: [{ name: 'a' }], nextCursor: 'abc' },
+		[{ name: 'mine' }],
+	);
+	assert.deepEqual(out.tools.map((t) => t.name), ['a']);
+	assert.equal(out.nextCursor, 'abc');
+});
+
+test('injectHookTools: injects on final page (no nextCursor)', () => {
+	const out = injectHookTools(
+		{ tools: [{ name: 'a' }], nextCursor: '' },
+		[{ name: 'mine' }],
+	);
+	assert.deepEqual(out.tools.map((t) => t.name), ['a', 'mine']);
+});
+
+test('injectHookTools: injects when nextCursor is null', () => {
+	const out = injectHookTools(
+		{ tools: [{ name: 'a' }], nextCursor: null },
+		[{ name: 'mine' }],
+	);
+	assert.deepEqual(out.tools.map((t) => t.name), ['a', 'mine']);
+});
+
 // ---- hookOwnsTool -------------------------------------------------------
 
 test('hookOwnsTool: matches by name', () => {

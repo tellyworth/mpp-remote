@@ -189,6 +189,17 @@ Contract:
 the integer; the bridge rejects hooks whose declared version it doesn't
 support. Additive changes (extra fields on the context object) don't bump.
 
+### Trust model
+
+A hook is **arbitrary local ESM** that runs in the bridge process. The trust
+boundary is the same as `npx -y github:...` — whoever invokes the bridge with
+`--hook <path>` is choosing to execute that file. There is no sandbox. A hook
+can read any file the bridge can, make any HTTP request the bridge can, and
+spend up to `MPP_MAX_AMOUNT_USD` per upstream tool call via `callTool` (which
+goes through the bridge's x402 signer). Name collisions in `tools/list` favor
+the hook, so a hook can shadow upstream tools — vet your hook files the same
+way you'd vet any dependency.
+
 ## Roadmap
 
 - Receipt caching for tools that accept receipts (`extend_share`-style flows).
